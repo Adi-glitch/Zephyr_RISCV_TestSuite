@@ -1,0 +1,55 @@
+stages:
+  - prepare
+  - build-and-test
+
+build-environment:
+  stage: prepare
+  image: docker:cli
+  services:
+    - docker:dind
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - Dockerfile
+      variables:
+        IMAGE_TAG: latest
+    - if: '$CI_COMMIT_REF_SLUG != $CI_DEFAULT_BRANCH'
+      changes:
+        - Dockerfile
+      variables:
+        IMAGE_TAG: $CI_COMMIT_REF_SLUG
+    - if: '$CI_COMMIT_MESSAGE =~ /\[rebuild image\]/'
+      variables:
+        IMAGE_TAG: latest
+  script:
+    - echo "Logging into GitLab Container Registry..."
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - echo "Building the Docker image..."
+    - docker build -t $CI_REGISTRY_IMAGE:$IMAGE_TAG .
+    - echo "Pushing the image to your private registry..."
+    - docker push $CI_REGISTRY_IMAGE:$IMAGE_TAG
+
+build-and-test:
+  stage: build-and-test
+  rules:
+    - if: '$CI_COMMIT_REF_SLUG != $CI_DEFAULT_BRANCH'
+      changes:
+        - Dockerfile
+      variables:
+        TEST_IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+    - when: always
+      variables:
+        TEST_IMAGE: $CI_REGISTRY_IMAGE:latest
+  image: $TEST_IMAGE
+  script:
+    - echo "--- Checking Environment ---"
+    - riscv64-unknown-elf-gcc --version | head -1
+    - spike --help 2>&1 | head -1 || true
+    - echo "--- Running Tests ---"
+    - make clean-spike
+    - make run
+  artifacts:
+    paths:
+      - build-spike/
+    expire_in: 1 week
+    when: always

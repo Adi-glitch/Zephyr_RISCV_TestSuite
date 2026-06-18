@@ -1,0 +1,16 @@
+build/
+*.o
+*.elf
+*.dump
+*.bin
+*.hex
+
+*.swp
+*.swo
+*~
+.nvim/
+*.memh64
+.vscode/
+
+.DS_Store
+Thumbs.db
