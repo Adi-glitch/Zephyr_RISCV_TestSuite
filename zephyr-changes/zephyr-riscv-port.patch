@@ -1,0 +1,604 @@
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index eb6170df081..1ec11101584 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -665,6 +665,47 @@ config RISCV_M_MODE_STACK_SIZE
+ 	  runtime handler. Increase this if the handler is extended with
+ 	  functionality that requires more stack space.
+ 
++config BAREMETAL_SUITE
++	bool "Boot directly into the out-of-tree bare-metal RV64 test suite"
++	depends on RISCV_S_MODE
++	help
++	  When enabled, the RISC-V reset path (reset.S) diverts after the
++	  M->S transition into the out-of-tree rv64gcv bare-metal test suite
++	  (its s_mode_entry/test_main), using the suite's own M-mode trap
++	  vector (_m_trap_vector), instead of starting the Zephyr kernel.
++	  This exists to run that test suite verbatim on QEMU virt. Leave
++	  disabled (default n) for normal Zephyr builds, which are unaffected.
++
++config RISCV_MMU
++	bool "RISC-V Sv39 MMU support"
++	depends on RISCV_S_MODE && 64BIT
++	select CPU_HAS_MMU
++	select MMU
++	help
++	  Enable Sv39 page-table memory management for RISC-V in Supervisor mode
++	  (the S-mode counterpart to PMP, which is M-mode only).
++
++	  The kernel builds Sv39 page tables at boot (mapping the kernel image and
++	  device MMIO, identity-mapped), turns on paging via satp, and provides
++	  arch_mem_map()/arch_mem_unmap() so the generic memory-management layer
++	  (k_mem_map(), etc.) works. The QEMU virt CPU is also given the "mmu=on"
++	  capability so satp is writable -- the same knob the bare-metal suite uses
++	  under CONFIG_BAREMETAL_SUITE.
++
++	  Default n; a separate, opt-in flag that leaves stock Zephyr builds and
++	  the bare-metal suite (CONFIG_BAREMETAL_SUITE) byte-for-byte untouched.
++
++config RISCV_MMU_NUM_TABLES
++	int "Number of Sv39 page tables in the static pool"
++	depends on RISCV_MMU
++	default 32
++	help
++	  Size of the statically-reserved page-table pool (each table is one 4 KB
++	  page). Page tables cannot come from the kernel heap: they are needed at
++	  early boot before the heap exists and from under the MMU spinlock. The
++	  boot mapping needs only a few; the rest cover runtime arch_mem_map().
++	  Increase if a build panics with the pool exhausted.
++
+ rsource "Kconfig.isa"
+ 
+ rsource "custom/Kconfig"
+diff --git a/arch/riscv/core/CMakeLists.txt b/arch/riscv/core/CMakeLists.txt
+index 04a60a92e38..00cbd8e8c14 100644
+--- a/arch/riscv/core/CMakeLists.txt
++++ b/arch/riscv/core/CMakeLists.txt
+@@ -31,6 +31,7 @@ zephyr_library_sources_ifdef(CONFIG_USE_ISR_WRAPPER isr.S)
+ zephyr_library_sources_ifdef(CONFIG_RISCV_S_MODE sbi.S)
+ zephyr_library_sources_ifdef(CONFIG_RISCV_PMP pmp.c pmp.S)
+ zephyr_linker_sources_ifdef(CONFIG_RISCV_PMP ROM_SECTIONS pmp.ld)
++zephyr_library_sources_ifdef(CONFIG_RISCV_MMU mmu.c)
+ zephyr_library_sources_ifdef(CONFIG_THREAD_LOCAL_STORAGE tls.c)
+ zephyr_library_sources_ifdef(CONFIG_USERSPACE userspace.S)
+ zephyr_library_sources_ifdef(CONFIG_SEMIHOST semihost.c)
+diff --git a/arch/riscv/core/fatal.c b/arch/riscv/core/fatal.c
+index d2d3fdeabc2..f9a1d4907bf 100644
+--- a/arch/riscv/core/fatal.c
++++ b/arch/riscv/core/fatal.c
+@@ -10,6 +10,7 @@
+ #include <inttypes.h>
+ #include <zephyr/arch/common/exc_handle.h>
+ #include <zephyr/logging/log.h>
++#include <kernel_arch_func.h>
+ LOG_MODULE_DECLARE(os, CONFIG_KERNEL_LOG_LEVEL);
+ 
+ #ifdef CONFIG_USERSPACE
+@@ -235,6 +236,27 @@ void z_riscv_fault(struct arch_esf *esf)
+ 	}
+ #endif /* CONFIG_USERSPACE */
+ 
++#ifdef CONFIG_RISCV_MMU
++	/*
++	 * Give a registered MMU resolver a chance to fix the PTE for a page
++	 * fault and retry (same slot as arm64 z_arm64_do_demand_paging / x86
++	 * z_x86_page_fault_handler). CONFIG_RISCV_MMU implies S-mode, so the
++	 * cause/tval live in scause/stval. Returning without touching esf->mepc
++	 * re-executes the faulting instruction. Inert unless a resolver is set.
++	 */
++	{
++		unsigned long scause, stval;
++
++		__asm__ volatile("csrr %0, scause" : "=r"(scause));
++		__asm__ volatile("csrr %0, stval" : "=r"(stval));
++
++		if ((scause == 12UL || scause == 13UL || scause == 15UL) &&
++		    z_riscv_mmu_try_fault_fixup(scause, stval)) {
++			return;
++		}
++	}
++#endif /* CONFIG_RISCV_MMU */
++
+ 	unsigned int reason = K_ERR_CPU_EXCEPTION;
+ 
+ 	if (bad_stack_pointer(esf)) {
+diff --git a/arch/riscv/core/mmu.c b/arch/riscv/core/mmu.c
+new file mode 100644
+index 00000000000..dc982cb02ec
+--- /dev/null
++++ b/arch/riscv/core/mmu.c
+@@ -0,0 +1,273 @@
++/*
++ * Copyright (c) 2026 Zephyr bare-metal-suite port.
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * RISC-V Sv39 MMU support (CONFIG_RISCV_MMU).
++ *
++ * S-mode counterpart to PMP (which is M-mode only). At boot the kernel image
++ * and device MMIO are identity-mapped and paging is turned on (satp); the rest
++ * of RAM is left unmapped for the generic layer (k_mem_map()) to hand out.
++ * arch_mem_map()/arch_mem_unmap() create/destroy runtime mappings.
++ *
++ * Everything is identity-mapped at boot (KERNEL_VM_BASE == SRAM base), so a
++ * page table's physical address equals the (virtual) address we hold it at, and
++ * the page-table walker (which reads physical addresses) and our C pointers
++ * agree without any phys<->virt translation.
++ */
++
++#include <zephyr/kernel.h>
++#include <zephyr/arch/riscv/csr.h>
++#include <zephyr/sys/util.h>
++#include <zephyr/spinlock.h>
++#include <zephyr/linker/linker-defs.h>
++#include <zephyr/kernel/mm.h>
++#include <kernel_arch_func.h>
++#include <kernel_arch_interface.h>
++#include <stdint.h>
++
++/* Sv39 PTE bits (PTE_V/R/W/X/U/A/D, PTE_PPN_SHIFT) come from csr.h. */
++#define PTE_XWR       (PTE_R | PTE_W | PTE_X)
++
++#define SV39_LEVELS   3
++#define PT_ENTRIES    512
++#define PAGE_SHIFT    12
++#define PAGE_SIZE_4K  4096UL
++
++/*
++ * Static page-table pool. Each table is one 4 KB page (512 * 8 bytes). Page
++ * tables must be allocatable before the kernel heap exists (z_riscv_mmu_init
++ * runs in prep_c) and from under mmu_lock, so they come from here, never the
++ * heap -- mirroring arm64 (xlat_tables) and the bare-metal suite's pool.
++ */
++static uint64_t mmu_tables[CONFIG_RISCV_MMU_NUM_TABLES][PT_ENTRIES]
++	__aligned(PAGE_SIZE_4K);
++static bool mmu_table_used[CONFIG_RISCV_MMU_NUM_TABLES];
++static struct k_spinlock mmu_lock;
++static uint64_t *kernel_root;
++
++static uint64_t *alloc_table(void)
++{
++	for (int i = 0; i < CONFIG_RISCV_MMU_NUM_TABLES; i++) {
++		if (!mmu_table_used[i]) {
++			mmu_table_used[i] = true;
++			for (int j = 0; j < PT_ENTRIES; j++) {
++				mmu_tables[i][j] = 0;
++			}
++			return mmu_tables[i];
++		}
++	}
++
++	k_panic(); /* CONFIG_RISCV_MMU_NUM_TABLES too small */
++	return NULL;
++}
++
++/* VPN[level] index for va. level 2 = root, 1, 0 = leaf level. */
++static inline unsigned int vpn(uintptr_t va, int level)
++{
++	return (va >> (PAGE_SHIFT + 9 * level)) & (PT_ENTRIES - 1);
++}
++
++static inline uintptr_t pte_to_phys(uint64_t pte)
++{
++	return (uintptr_t)((pte >> PTE_PPN_SHIFT) << PAGE_SHIFT);
++}
++
++static inline uint64_t phys_to_ppn(uintptr_t pa)
++{
++	return ((uint64_t)(pa >> PAGE_SHIFT)) << PTE_PPN_SHIFT;
++}
++
++/* Map one 4 KB page va->pa with the given leaf permission bits (R/W/X/U). */
++static void map_page(uintptr_t va, uintptr_t pa, uint64_t perm)
++{
++	uint64_t *tbl = kernel_root;
++
++	for (int level = SV39_LEVELS - 1; level > 0; level--) {
++		uint64_t *pte = &tbl[vpn(va, level)];
++
++		if (!(*pte & PTE_V)) {
++			uint64_t *next = alloc_table();
++			/* non-leaf PTE: V set, R/W/X clear (pointer to next level) */
++			*pte = phys_to_ppn((uintptr_t)next) | PTE_V;
++		}
++		tbl = (uint64_t *)pte_to_phys(*pte);
++	}
++
++	tbl[vpn(va, 0)] = phys_to_ppn(pa) | perm | PTE_V | PTE_A | PTE_D;
++}
++
++/* Map a 1 GB gigapage (leaf at root level). va/pa must be 1 GB aligned. */
++static void map_gigapage(uintptr_t va, uintptr_t pa, uint64_t perm)
++{
++	kernel_root[vpn(va, 2)] = phys_to_ppn(pa) | perm | PTE_V | PTE_A | PTE_D;
++}
++
++/* Invalidate the leaf PTE covering va (handles a superpage leaf at any level). */
++static void unmap_page(uintptr_t va)
++{
++	uint64_t *tbl = kernel_root;
++
++	for (int level = SV39_LEVELS - 1; level > 0; level--) {
++		uint64_t *pte = &tbl[vpn(va, level)];
++
++		if (!(*pte & PTE_V)) {
++			return; /* already unmapped */
++		}
++		if (*pte & PTE_XWR) {
++			*pte = 0; /* superpage leaf at this level */
++			return;
++		}
++		tbl = (uint64_t *)pte_to_phys(*pte);
++	}
++
++	tbl[vpn(va, 0)] = 0;
++}
++
++static uint64_t perm_from_flags(uint32_t flags)
++{
++	uint64_t perm = PTE_R; /* mapped memory is always readable */
++
++	if (flags & K_MEM_PERM_RW) {
++		perm |= PTE_W;
++	}
++	if (flags & K_MEM_PERM_EXEC) {
++		perm |= PTE_X;
++	}
++	if (flags & K_MEM_PERM_USER) {
++		perm |= PTE_U;
++	}
++	return perm;
++}
++
++void arch_mem_map(void *virt, uintptr_t phys, size_t size, uint32_t flags)
++{
++	uintptr_t va = (uintptr_t)virt;
++	uint64_t perm = perm_from_flags(flags);
++	k_spinlock_key_t key = k_spin_lock(&mmu_lock);
++
++	for (size_t off = 0; off < size; off += PAGE_SIZE_4K) {
++		map_page(va + off, phys + off, perm);
++	}
++	__asm__ volatile("sfence.vma" ::: "memory");
++
++	k_spin_unlock(&mmu_lock, key);
++}
++
++void arch_mem_unmap(void *addr, size_t size)
++{
++	uintptr_t va = (uintptr_t)addr;
++	k_spinlock_key_t key = k_spin_lock(&mmu_lock);
++
++	for (size_t off = 0; off < size; off += PAGE_SIZE_4K) {
++		unmap_page(va + off);
++	}
++	__asm__ volatile("sfence.vma" ::: "memory");
++
++	k_spin_unlock(&mmu_lock, key);
++}
++
++/*
++ * Resumable page-fault hook. z_riscv_fault() (gated) offers a registered
++ * resolver a chance to fix the PTE for a page fault and signal "retry"; if
++ * none is registered (the default) the fault stays fatal exactly as before.
++ * Same control-flow slot as arm64's z_arm64_do_demand_paging and x86's
++ * z_x86_page_fault_handler; the resolver here is supplied by the caller rather
++ * than being the generic demand-paging resolver. Default-inert => production
++ * behavior is unchanged.
++ */
++static bool (*mmu_fault_fixup)(unsigned long scause, unsigned long stval);
++
++void z_riscv_mmu_set_fault_fixup(bool (*fn)(unsigned long scause,
++					    unsigned long stval))
++{
++	mmu_fault_fixup = fn;
++}
++
++bool z_riscv_mmu_try_fault_fixup(unsigned long scause, unsigned long stval)
++{
++	return mmu_fault_fixup != NULL && mmu_fault_fixup(scause, stval);
++}
++
++/*
++ * Raw-control companions to the portable API above. The K_MEM_PERM_* flags
++ * deliberately cannot express individual PTE bits (V-only games, A/D, U
++ * without the kernel's policy) or superpage levels; these two give tests and
++ * arch-aware code that control while the kernel stays in charge of the tables.
++ */
++
++uint64_t *z_riscv_mmu_pte_lookup(uintptr_t va)
++{
++	uint64_t *tbl = kernel_root;
++
++	for (int level = SV39_LEVELS - 1; level > 0; level--) {
++		uint64_t *pte = &tbl[vpn(va, level)];
++
++		if (!(*pte & PTE_V)) {
++			return NULL;
++		}
++		if (*pte & PTE_XWR) {
++			return pte; /* superpage leaf at this level */
++		}
++		tbl = (uint64_t *)pte_to_phys(*pte);
++	}
++
++	return &tbl[vpn(va, 0)];
++}
++
++void z_riscv_mmu_map_raw(uintptr_t va, uintptr_t pa, uint64_t pte_bits, int level)
++{
++	size_t leaf_span = 1UL << (PAGE_SHIFT + 9 * level);
++	uint64_t *tbl = kernel_root;
++	k_spinlock_key_t key;
++
++	__ASSERT(level >= 0 && level < SV39_LEVELS, "bad level %d", level);
++	__ASSERT((va % leaf_span) == 0, "va 0x%lx not aligned to level %d", va, level);
++	__ASSERT((pa % leaf_span) == 0, "pa 0x%lx not aligned to level %d", pa, level);
++
++	key = k_spin_lock(&mmu_lock);
++
++	for (int l = SV39_LEVELS - 1; l > level; l--) {
++		uint64_t *pte = &tbl[vpn(va, l)];
++
++		if (!(*pte & PTE_V)) {
++			uint64_t *next = alloc_table();
++
++			*pte = phys_to_ppn((uintptr_t)next) | PTE_V;
++		}
++		tbl = (uint64_t *)pte_to_phys(*pte);
++	}
++
++	/* exactly the caller's bits -- including, on purpose, V=0 if asked */
++	tbl[vpn(va, level)] = phys_to_ppn(pa) | pte_bits;
++	__asm__ volatile("sfence.vma" ::: "memory");
++
++	k_spin_unlock(&mmu_lock, key);
++}
++
++void z_riscv_mmu_init(void)
++{
++	kernel_root = alloc_table();
++
++	/* Device MMIO: identity-map the low 1 GB R/W (no execute) as a single
++	 * gigapage -- covers CLINT, PLIC, UART, the sifive_test finisher. */
++	map_gigapage(0x0UL, 0x0UL, PTE_R | PTE_W);
++
++	/* Kernel image: identity-map [z_mapped_start, z_mapped_end) R/W/X at 4 KB.
++	 * This is the only RAM mapped at boot; the rest stays unmapped so the
++	 * generic layer can allocate it for k_mem_map(). */
++	uintptr_t start = (uintptr_t)z_mapped_start;
++	uintptr_t end = (uintptr_t)z_mapped_end;
++
++	for (uintptr_t va = start; va < end; va += PAGE_SIZE_4K) {
++		map_page(va, va, PTE_R | PTE_W | PTE_X);
++	}
++
++	unsigned long satp_val = ((unsigned long)SATP_MODE_SV39 << 60) |
++				 ((uintptr_t)kernel_root >> PAGE_SHIFT);
++
++	csr_write(satp, satp_val);
++	__asm__ volatile("sfence.vma" ::: "memory");
++}
+diff --git a/arch/riscv/core/prep_c.c b/arch/riscv/core/prep_c.c
+index c22df9730f1..80640937c3e 100644
+--- a/arch/riscv/core/prep_c.c
++++ b/arch/riscv/core/prep_c.c
+@@ -22,6 +22,7 @@
+ #include <zephyr/arch/cache.h>
+ #include <zephyr/arch/common/xip.h>
+ #include <zephyr/arch/common/init.h>
++#include <kernel_arch_func.h>
+ 
+ #if defined(CONFIG_RISCV_SOC_INTERRUPT_INIT)
+ void soc_interrupt_init(void);
+@@ -40,6 +41,11 @@ FUNC_NORETURN void z_prep_c(void)
+ 
+ 	arch_bss_zero();
+ 	arch_data_copy();
++#if defined(CONFIG_RISCV_MMU)
++	/* Turn on Sv39 paging before the kernel proper starts. Identity-mapped,
++	 * so addresses are unchanged from here on. */
++	z_riscv_mmu_init();
++#endif
+ #if defined(CONFIG_RISCV_SOC_INTERRUPT_INIT)
+ 	soc_interrupt_init();
+ #endif
+diff --git a/arch/riscv/core/reset.S b/arch/riscv/core/reset.S
+index 43759a677a2..b9ab00722f0 100644
+--- a/arch/riscv/core/reset.S
++++ b/arch/riscv/core/reset.S
+@@ -32,6 +32,14 @@ GTEXT(arch_secondary_cpu_init)
+ #ifdef CONFIG_RISCV_S_MODE
+ GTEXT(__m_mode_sbi_handler)
+ #endif
++#ifdef CONFIG_BAREMETAL_SUITE
++/* Out-of-tree bare-metal test suite entry + its own M-mode trap vector */
++GTEXT(baremetal_main)
++GTEXT(_m_trap_vector)
++/* Secondary-hart (P4) park loop + its dedicated stack */
++GTEXT(core1_smode_park_loop)
++GDATA(_bm_secondary_stack_top)
++#endif
+ 
+ #if CONFIG_INCLUDE_RESET_VECTOR
+ SECTION_FUNC(reset, __reset)
+@@ -144,8 +152,15 @@ aa_loop:
+ #endif
+ 
+ #ifdef CONFIG_RISCV_S_MODE
+-	/* Set M-mode trap vector to our SBI handler */
++	/* Set M-mode trap vector. For the bare-metal suite use its own
++	 * M-mode handler (_m_trap_vector) so unknown S-mode ecalls are
++	 * reflected back to S-mode exactly like the suite's m_trap.c.
++	 */
++#ifdef CONFIG_BAREMETAL_SUITE
++	la t0, _m_trap_vector
++#else
+ 	la t0, __m_mode_sbi_handler
++#endif
+ 	csrw mtvec, t0
+ 
+ 	/* Delegate all exceptions to S-mode except S-mode ecall and
+@@ -176,9 +191,19 @@ aa_loop:
+ 	li t0, (MCOUNTEREN_CY | MCOUNTEREN_TM | MCOUNTEREN_IR)
+ 	csrw mcounteren, t0
+ 
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* The bare-metal suite arms the M-timer on demand via its SBI set_timer
++	 * (which sets mie.MTIE itself in m_trap.c). Enabling only M-software
++	 * interrupts here delivers the suite's IPIs (CLINT MSIP) and avoids a
++	 * spurious boot timer, since QEMU resets mtimecmp to 0.
++	 */
++	li t0, MIP_MSIP
++	csrs mie, t0
++#else
+ 	/* Enable M-mode timer interrupt so MTIP fires and is forwarded to S-mode as STIP */
+ 	li t0, MIP_MTIP
+ 	csrs mie, t0
++#endif
+ 
+ 	/* Set MPP=S-mode in mstatus then mret into S-mode */
+ 	li t0, MSTATUS_MPP
+@@ -196,10 +221,53 @@ s_mode_entry:
+ 	 * Jump into C domain. z_prep_c zeroes BSS, copies rw data into RAM,
+ 	 * and then enters kernel z_cstart
+ 	 */
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* Bypass the Zephyr kernel: hand off to the bare-metal test suite,
++	 * which sets stvec and runs test_main(). Never returns.
++	 */
++	call baremetal_main
++#else
+ 	call z_prep_c
++#endif
+ 
+ boot_secondary_core:
+-#if CONFIG_MP_MAX_NUM_CPUS > 1
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* Bare-metal suite (P4): bring hart 1 up like the suite's boot.S — its own
++	 * stack and the same M-mode setup hart 0 got (open PMP, delegation, our
++	 * M-trap vector, M-software interrupt for IPIs), then mret to S-mode into
++	 * core1_smode_park_loop(), where it waits for an IPI from hart 0. This is
++	 * self-contained so it does not pull in Zephyr's SMP secondary logic.
++	 */
++	la sp, _bm_secondary_stack_top
++
++	la t0, _m_trap_vector
++	csrw mtvec, t0
++
++	li t0, ~((1 << RISCV_EXC_ECALLS) | (1 << RISCV_EXC_ECALLM))
++	csrw medeleg, t0
++
++	li t0, (MIP_SSIP | MIP_STIP | MIP_SEIP)
++	csrw mideleg, t0
++
++	/* PMP entry 0: NAPOT RWX over all memory (S-mode has no access otherwise) */
++	li t0, -1
++	csrw pmpaddr0, t0
++	li t0, (PMP_NAPOT | PMP_R | PMP_W | PMP_X)
++	csrw pmpcfg0, t0
++
++	/* Enable M-software interrupt so hart-0 IPIs (CLINT MSIP) are delivered */
++	li t0, MIP_MSIP
++	csrs mie, t0
++
++	/* MPP = S-mode, then mret into the S-mode park loop */
++	li t0, MSTATUS_MPP
++	csrc mstatus, t0
++	li t0, MSTATUS_MPP_S
++	csrs mstatus, t0
++	la t0, core1_smode_park_loop
++	csrw mepc, t0
++	mret
++#elif CONFIG_MP_MAX_NUM_CPUS > 1
+ 	la t0, riscv_cpu_wake_flag
+ 	li t1, -1
+ 	sr t1, 0(t0)
+diff --git a/arch/riscv/include/kernel_arch_func.h b/arch/riscv/include/kernel_arch_func.h
+index c25f92d5fa8..bedf6374c2a 100644
+--- a/arch/riscv/include/kernel_arch_func.h
++++ b/arch/riscv/include/kernel_arch_func.h
+@@ -125,6 +125,33 @@ extern FUNC_NORETURN void z_riscv_switch_to_main_no_multithreading(
+ 
+ #endif /* !CONFIG_MULTITHREADING */
+ 
++#ifdef CONFIG_RISCV_MMU
++/* Build the kernel's Sv39 page tables and turn on paging (write satp). Called
++ * from z_prep_c() on the primary hart before z_cstart(). */
++void z_riscv_mmu_init(void);
++
++/* Walk the live Sv39 tables and return a pointer to the leaf PTE covering va
++ * (including a superpage leaf at level 2/1), or NULL if an intermediate level
++ * is invalid. Tables are identity-mapped, so the pointer is dereferenceable;
++ * a caller that modifies bits must issue sfence.vma itself. */
++uint64_t *z_riscv_mmu_pte_lookup(uintptr_t va);
++
++/* Raw mapper (the bare-metal suite's pt_map_page equivalent): create
++ * intermediates as needed, then write the leaf at the given level (0 = 4 KB,
++ * 1 = 2 MB, 2 = 1 GB) as exactly ppn(pa) | pte_bits. The caller supplies ALL
++ * PTE bits (PTE_V/R/W/X/U/A/D from csr.h) -- V=0 entries are constructible on
++ * purpose. va/pa must be aligned to the level's span. */
++void z_riscv_mmu_map_raw(uintptr_t va, uintptr_t pa, uint64_t pte_bits, int level);
++
++/* Resumable page-fault hook. Register a resolver that, given a page fault's
++ * scause/stval, fixes the PTE and returns true to retry the faulting
++ * instruction (or false to let it stay fatal). z_riscv_fault() consults it for
++ * causes 12/13/15. Default NULL => faults remain fatal as before. */
++void z_riscv_mmu_set_fault_fixup(bool (*fn)(unsigned long scause,
++					    unsigned long stval));
++bool z_riscv_mmu_try_fault_fixup(unsigned long scause, unsigned long stval);
++#endif /* CONFIG_RISCV_MMU */
++
+ #endif /* _ASMLANGUAGE */
+ 
+ #ifdef __cplusplus
+diff --git a/boards/qemu/riscv64/board.cmake b/boards/qemu/riscv64/board.cmake
+index af83c16f7fb..2700262f36c 100644
+--- a/boards/qemu/riscv64/board.cmake
++++ b/boards/qemu/riscv64/board.cmake
+@@ -29,6 +29,23 @@ if(CONFIG_RISCV_S_MODE)
+   string(APPEND qemu_riscv_cpu ",s=on,u=on,pmp=on,priv_spec=v1.12.0,sv39=on")
+ endif()
+ 
++if(CONFIG_BAREMETAL_SUITE)
++  # The S-mode CPU string above advertises sv39 but not the MMU capability, and
++  # QEMU keeps satp read-only-zero (Bare mode) unless mmu=on. The bare-metal
++  # suite (P1*) enables Sv39 paging itself, so add it. Gated to keep normal
++  # Zephyr builds unchanged.
++  string(APPEND qemu_riscv_cpu ",mmu=on")
++endif()
++
++if(CONFIG_RISCV_MMU AND NOT CONFIG_BAREMETAL_SUITE)
++  # Same reason as the bare-metal block above: the S-mode CPU advertises sv39
++  # but not the MMU capability, so QEMU keeps satp read-only-zero unless
++  # mmu=on. The idiomatic Zephyr MMU feature (CONFIG_RISCV_MMU) needs a
++  # writable satp. Separate, gated block so the bare-metal path is untouched;
++  # the NOT-BAREMETAL guard avoids appending mmu=on twice if both are set.
++  string(APPEND qemu_riscv_cpu ",mmu=on")
++endif()
++
+ set(QEMU_CPU_TYPE_${ARCH} "${qemu_riscv_cpu}")
+ 
+ set(QEMU_FLAGS_${ARCH}
+diff --git a/include/zephyr/arch/riscv/common/linker.ld b/include/zephyr/arch/riscv/common/linker.ld
+index d272f621be5..32a71cb238a 100644
+--- a/include/zephyr/arch/riscv/common/linker.ld
++++ b/include/zephyr/arch/riscv/common/linker.ld
+@@ -150,6 +150,15 @@ SECTIONS
+     GROUP_START(ROMABLE_REGION)
+     __rom_region_start = ROM_BASE;
+ 
++#ifndef CONFIG_XIP
++    /* Start of the kernel image as mapped at boot. ROM_BASE is page-aligned
++     * and for non-XIP builds ROM==RAM, so the whole image (reset, exceptions,
++     * text, rodata, data, bss) lies in [z_mapped_start, z_mapped_end);
++     * CONFIG_RISCV_MMU identity-maps exactly that range before enabling
++     * paging. z_mapped_end is defined by linker/ram-end.ld. */
++    z_mapped_start = ROM_BASE;
++#endif
++
+     SECTION_PROLOGUE(rom_start,,)
+     {
+ 		. = ALIGN(16);

@@ -1,138 +1,91 @@
-# Zephyr Example Application
+# Zephyr RISC-V Test Suite — bare-metal port + idiomatic ztest suite
 
-<a href="https://github.com/zephyrproject-rtos/example-application/actions/workflows/build.yml?query=branch%3Amain">
-  <img src="https://github.com/zephyrproject-rtos/example-application/actions/workflows/build.yml/badge.svg?event=push">
-</a>
-<a href="https://github.com/zephyrproject-rtos/example-application/actions/workflows/docs.yml?query=branch%3Amain">
-  <img src="https://github.com/zephyrproject-rtos/example-application/actions/workflows/docs.yml/badge.svg?event=push">
-</a>
-<a href="https://zephyrproject-rtos.github.io/example-application">
-  <img alt="Documentation" src="https://img.shields.io/badge/documentation-3D578C?logo=sphinx&logoColor=white">
-</a>
-<a href="https://zephyrproject-rtos.github.io/example-application/doxygen">
-  <img alt="API Documentation" src="https://img.shields.io/badge/API-documentation-3D578C?logo=c&logoColor=white">
-</a>
+Porting an **RV64GC(V) bare-metal test suite** (memory/MMU, interrupts, atomics, dual-core)
+onto **Zephyr / QEMU `virt`**, two ways:
 
-This repository contains a Zephyr example application. The main purpose of this
-repository is to serve as a reference on how to structure Zephyr-based
-applications. Some of the features demonstrated in this example are:
+1. **`baremetal/`** — *exact transfer*: Zephyr boots, then (behind a gate) **bypasses its own
+   kernel** and runs the suite's `tests/p*.c` **verbatim**, reusing the suite's M/S-mode trap
+   framework. Verdict via the QEMU `sifive_test` finisher.
+2. **`zephyr-suite/`** — *idiomatic*: the **full Zephyr kernel runs** (S-mode) and the same
+   chip features are tested with **Zephyr APIs + ztest**, reported by **twister**. This effort
+   also added real **Sv39 MMU support to the Zephyr RISC-V kernel** (`CONFIG_RISCV_MMU`).
 
-- Basic [Zephyr application][app_dev] skeleton
-- [Zephyr workspace applications][workspace_app]
-- [Zephyr modules][modules]
-- [West T2 topology][west_t2]
-- [Custom boards][board_porting]
-- Custom [devicetree bindings][bindings]
-- Out-of-tree [drivers][drivers]
-- Out-of-tree libraries
-- Example CI configuration (using GitHub Actions)
-- Custom [west extension][west_ext]
-- Custom [Zephyr runner][runner_ext]
-- Doxygen and Sphinx documentation boilerplate
+`rv64gcv-baremetal-testsuite-main/` is the original suite being ported (reference).
 
-This repository is versioned together with the [Zephyr main tree][zephyr]. This
-means that every time that Zephyr is tagged, this repository is tagged as well
-with the same version number, and the [manifest](west.yml) entry for `zephyr`
-will point to the corresponding Zephyr tag. For example, the `example-application`
-v2.6.0 will point to Zephyr v2.6.0. Note that the `main` branch always
-points to the development branch of Zephyr, also `main`.
+## History: the "before → now" diff
 
-[app_dev]: https://docs.zephyrproject.org/latest/develop/application/index.html
-[workspace_app]: https://docs.zephyrproject.org/latest/develop/application/index.html#zephyr-workspace-app
-[modules]: https://docs.zephyrproject.org/latest/develop/modules.html
-[west_t2]: https://docs.zephyrproject.org/latest/develop/west/workspaces.html#west-t2
-[board_porting]: https://docs.zephyrproject.org/latest/guides/porting/board_porting.html
-[bindings]: https://docs.zephyrproject.org/latest/guides/dts/bindings.html
-[drivers]: https://docs.zephyrproject.org/latest/reference/drivers/index.html
-[zephyr]: https://github.com/zephyrproject-rtos/zephyr
-[west_ext]: https://docs.zephyrproject.org/latest/develop/west/extensions.html
-[runner_ext]: https://docs.zephyrproject.org/latest/develop/modules.html#external-runners
+This repo is two commits so the change set is explicit:
 
-## Getting Started
+| Commit | |
+|---|---|
+| **1 — baseline** | upstream Zephyr `example-application` (v4.4.0) + the original RV64GCV bare-metal suite; pristine Zephyr @ `046a4308909` |
+| **2 — our work** | `baremetal/` + `zephyr-suite/` apps + `zephyr-changes/` (the gated kernel patch) |
 
-Before getting started, make sure you have a proper Zephyr development
-environment. Follow the official
-[Zephyr Getting Started Guide](https://docs.zephyrproject.org/latest/getting_started/index.html).
-
-### Initialization
-
-The first step is to initialize the workspace folder (``my-workspace``) where
-the ``example-application`` and all Zephyr modules will be cloned. Run the following
-command:
-
-```shell
-# initialize my-workspace for the example-application (main branch)
-west init -m https://github.com/zephyrproject-rtos/example-application --mr main my-workspace
-# update Zephyr modules
-cd my-workspace
-west update
+```sh
+git diff --stat HEAD~1 HEAD     # exactly what the port adds
 ```
 
-### Building and running
+## Layout
 
-To build the application, run the following command:
-
-```shell
-cd example-application
-west build -b $BOARD app
+```
+baremetal/                     exact-transfer apps (p0_sanity … p4_dualcore) + common/ + PORTING_NOTES.md
+zephyr-suite/                  idiomatic ztest apps (p0_sanity … p4_dualcore) + NOTES.md
+zephyr-changes/                gated Zephyr RISC-V kernel patch + how-to-apply README
+rv64gcv-baremetal-testsuite-main/   original bare-metal suite (reference being ported)
+<example-application scaffolding: app/ boards/ drivers/ dts/ lib/ tests/ west.yml …>
 ```
 
-where `$BOARD` is the target board.
+Read first: `zephyr-suite/NOTES.md` (design, suite-coverage map, kernel-change table) and
+`baremetal/PORTING_NOTES.md` (every gated edit + why).
 
-You can use the `custom_plank` board found in this
-repository. Note that Zephyr sample boards may be used if an
-appropriate overlay is provided (see `app/boards`).
+## Reproduce the workspace (teammates)
 
-A sample debug configuration is also provided. To apply it, run the following
-command:
+The 9 GB Zephyr + modules tree is **not** in this repo — rebuild it with west, then apply the
+kernel patch and point west at these apps:
 
-```shell
-west build -b $BOARD app -- -DEXTRA_CONF_FILE=debug.conf
+```sh
+# 1. a west workspace with the exact Zephyr base this was built on
+west init -m https://github.com/zephyrproject-rtos/zephyr --mr 046a4308909 ws
+cd ws && west update && west zephyr-export
+pip install -r zephyr/scripts/requirements.txt
+
+# 2. apply the gated kernel changes (see zephyr-changes/README.md)
+cd zephyr && git apply /path/to/zephyr-changes/zephyr-riscv-port.patch && cd ..
+
+# 3. put this repo's apps where west can build them (e.g. clone alongside, or copy
+#    baremetal/ and zephyr-suite/ into the workspace)
+git clone https://github.com/Adi-glitch/Zephyr_RISCV_TestSuite.git
+export ZEPHYR_BASE=$PWD/zephyr
 ```
 
-Once you have built the application, run the following command to flash it:
+(Or just build from a checkout of this repo with `ZEPHYR_BASE` pointing at your patched Zephyr.)
 
-```shell
-west flash
+## Build & run
+
+S-mode board for P0–P3; the SMP board for P4. Bound the QEMU run so output flushes.
+
+```sh
+# idiomatic ztest phase (example: P1 MMU)
+west build -p always -b qemu_riscv64/qemu_virt_riscv64/smode -d build/p1a zephyr-suite/p1a_mmu_enable
+perl -e 'alarm 30; exec @ARGV' west build -t run -d build/p1a
+
+# dual-core uses the SMP board
+west build -p always -b qemu_riscv64/qemu_virt_riscv64/smp   -d build/p4 zephyr-suite/p4_dualcore
+
+# bare-metal exact-transfer phase
+west build -p always -b qemu_riscv64/qemu_virt_riscv64/smode -d build/bm_p1a baremetal/p1a_mmu_enable
+perl -e 'alarm 30; exec @ARGV' west build -t run -d build/bm_p1a    # => "Phase 1A: ALL TESTS PASSED" / [PASS]
+
+# whole idiomatic suite via twister
+west twister -T zephyr-suite \
+  -p qemu_riscv64/qemu_virt_riscv64/smode -p qemu_riscv64/qemu_virt_riscv64/smp
 ```
 
-### Testing
+## Status
 
-To execute Twister integration tests, run the following command:
-
-```shell
-west twister -T tests --integration
-```
-
-### Documentation
-
-A minimal documentation setup is provided for Doxygen and Sphinx. To build the
-documentation first change to the ``doc`` folder:
-
-```shell
-cd doc
-```
-
-Before continuing, check if you have Doxygen installed. It is recommended to
-use the same Doxygen version used in [CI](.github/workflows/docs.yml). To
-install Sphinx, make sure you have a Python installation in place and run:
-
-```shell
-pip install -r requirements.txt
-```
-
-API documentation (Doxygen) can be built using the following command:
-
-```shell
-doxygen
-```
-
-The output will be stored in the ``_build_doxygen`` folder. Similarly, the
-Sphinx documentation (HTML) can be built using the following command:
-
-```shell
-make html
-```
-
-The output will be stored in the ``_build_sphinx`` folder. You may check for
-other output formats other than HTML by running ``make help``.
+- **Idiomatic suite (`zephyr-suite/`): twister green — 8/8 configurations, 49/49 test cases**
+  (P0 5, P1A 3, P1B 12, P1C 5, P1D 5, P2 5, P3 8, P4 6).
+- **Bare-metal suite (`baremetal/`): P0, P1A–P1D, P2, P3, P4 all pass.**
+- All Zephyr-tree edits are gated (`CONFIG_BAREMETAL_SUITE`, `CONFIG_RISCV_MMU`, default off) —
+  stock Zephyr builds are unaffected. Coverage caveats (a few fix-retry / timer-ownership
+  cases) are documented in `zephyr-suite/NOTES.md`.

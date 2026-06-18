@@ -1,0 +1,9 @@
+common:
+  tags: riscv sanity
+tests:
+  app.zephyr_suite.p0_sanity:
+    # Needs S-mode (sstatus CSR, S-mode trap path).
+    platform_allow:
+      - qemu_riscv64/qemu_virt_riscv64/smode
+    integration_platforms:
+      - qemu_riscv64/qemu_virt_riscv64/smode

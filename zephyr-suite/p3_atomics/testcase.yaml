@@ -1,0 +1,9 @@
+common:
+  tags: riscv atomics
+tests:
+  app.zephyr_suite.p3_atomics:
+    filter: CONFIG_RISCV_ISA_EXT_A
+    platform_allow:
+      - qemu_riscv64/qemu_virt_riscv64/smode
+    integration_platforms:
+      - qemu_riscv64/qemu_virt_riscv64/smode

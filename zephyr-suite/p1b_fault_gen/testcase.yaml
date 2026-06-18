@@ -1,0 +1,9 @@
+common:
+  tags: riscv mmu
+tests:
+  app.zephyr_suite.p1b:
+    # Needs S-mode (satp) + the gated mmu=on this board provides for CONFIG_RISCV_MMU.
+    platform_allow:
+      - qemu_riscv64/qemu_virt_riscv64/smode
+    integration_platforms:
+      - qemu_riscv64/qemu_virt_riscv64/smode

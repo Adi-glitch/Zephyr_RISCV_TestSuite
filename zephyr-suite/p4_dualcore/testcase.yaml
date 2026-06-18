@@ -1,0 +1,9 @@
+common:
+  tags: riscv smp
+tests:
+  app.zephyr_suite.p4_dualcore:
+    filter: CONFIG_SMP
+    platform_allow:
+      - qemu_riscv64/qemu_virt_riscv64/smp
+    integration_platforms:
+      - qemu_riscv64/qemu_virt_riscv64/smp

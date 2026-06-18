@@ -1,0 +1,152 @@
+diff --git a/arch/riscv/Kconfig b/arch/riscv/Kconfig
+index eb6170df081..2ad6092fc0a 100644
+--- a/arch/riscv/Kconfig
++++ b/arch/riscv/Kconfig
+@@ -665,6 +665,17 @@ config RISCV_M_MODE_STACK_SIZE
+ 	  runtime handler. Increase this if the handler is extended with
+ 	  functionality that requires more stack space.
+ 
++config BAREMETAL_SUITE
++	bool "Boot directly into the out-of-tree bare-metal RV64 test suite"
++	depends on RISCV_S_MODE
++	help
++	  When enabled, the RISC-V reset path (reset.S) diverts after the
++	  M->S transition into the out-of-tree rv64gcv bare-metal test suite
++	  (its s_mode_entry/test_main), using the suite's own M-mode trap
++	  vector (_m_trap_vector), instead of starting the Zephyr kernel.
++	  This exists to run that test suite verbatim on QEMU virt. Leave
++	  disabled (default n) for normal Zephyr builds, which are unaffected.
++
+ rsource "Kconfig.isa"
+ 
+ rsource "custom/Kconfig"
+diff --git a/arch/riscv/core/reset.S b/arch/riscv/core/reset.S
+index 43759a677a2..b9ab00722f0 100644
+--- a/arch/riscv/core/reset.S
++++ b/arch/riscv/core/reset.S
+@@ -32,6 +32,14 @@ GTEXT(arch_secondary_cpu_init)
+ #ifdef CONFIG_RISCV_S_MODE
+ GTEXT(__m_mode_sbi_handler)
+ #endif
++#ifdef CONFIG_BAREMETAL_SUITE
++/* Out-of-tree bare-metal test suite entry + its own M-mode trap vector */
++GTEXT(baremetal_main)
++GTEXT(_m_trap_vector)
++/* Secondary-hart (P4) park loop + its dedicated stack */
++GTEXT(core1_smode_park_loop)
++GDATA(_bm_secondary_stack_top)
++#endif
+ 
+ #if CONFIG_INCLUDE_RESET_VECTOR
+ SECTION_FUNC(reset, __reset)
+@@ -144,8 +152,15 @@ aa_loop:
+ #endif
+ 
+ #ifdef CONFIG_RISCV_S_MODE
+-	/* Set M-mode trap vector to our SBI handler */
++	/* Set M-mode trap vector. For the bare-metal suite use its own
++	 * M-mode handler (_m_trap_vector) so unknown S-mode ecalls are
++	 * reflected back to S-mode exactly like the suite's m_trap.c.
++	 */
++#ifdef CONFIG_BAREMETAL_SUITE
++	la t0, _m_trap_vector
++#else
+ 	la t0, __m_mode_sbi_handler
++#endif
+ 	csrw mtvec, t0
+ 
+ 	/* Delegate all exceptions to S-mode except S-mode ecall and
+@@ -176,9 +191,19 @@ aa_loop:
+ 	li t0, (MCOUNTEREN_CY | MCOUNTEREN_TM | MCOUNTEREN_IR)
+ 	csrw mcounteren, t0
+ 
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* The bare-metal suite arms the M-timer on demand via its SBI set_timer
++	 * (which sets mie.MTIE itself in m_trap.c). Enabling only M-software
++	 * interrupts here delivers the suite's IPIs (CLINT MSIP) and avoids a
++	 * spurious boot timer, since QEMU resets mtimecmp to 0.
++	 */
++	li t0, MIP_MSIP
++	csrs mie, t0
++#else
+ 	/* Enable M-mode timer interrupt so MTIP fires and is forwarded to S-mode as STIP */
+ 	li t0, MIP_MTIP
+ 	csrs mie, t0
++#endif
+ 
+ 	/* Set MPP=S-mode in mstatus then mret into S-mode */
+ 	li t0, MSTATUS_MPP
+@@ -196,10 +221,53 @@ s_mode_entry:
+ 	 * Jump into C domain. z_prep_c zeroes BSS, copies rw data into RAM,
+ 	 * and then enters kernel z_cstart
+ 	 */
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* Bypass the Zephyr kernel: hand off to the bare-metal test suite,
++	 * which sets stvec and runs test_main(). Never returns.
++	 */
++	call baremetal_main
++#else
+ 	call z_prep_c
++#endif
+ 
+ boot_secondary_core:
+-#if CONFIG_MP_MAX_NUM_CPUS > 1
++#ifdef CONFIG_BAREMETAL_SUITE
++	/* Bare-metal suite (P4): bring hart 1 up like the suite's boot.S — its own
++	 * stack and the same M-mode setup hart 0 got (open PMP, delegation, our
++	 * M-trap vector, M-software interrupt for IPIs), then mret to S-mode into
++	 * core1_smode_park_loop(), where it waits for an IPI from hart 0. This is
++	 * self-contained so it does not pull in Zephyr's SMP secondary logic.
++	 */
++	la sp, _bm_secondary_stack_top
++
++	la t0, _m_trap_vector
++	csrw mtvec, t0
++
++	li t0, ~((1 << RISCV_EXC_ECALLS) | (1 << RISCV_EXC_ECALLM))
++	csrw medeleg, t0
++
++	li t0, (MIP_SSIP | MIP_STIP | MIP_SEIP)
++	csrw mideleg, t0
++
++	/* PMP entry 0: NAPOT RWX over all memory (S-mode has no access otherwise) */
++	li t0, -1
++	csrw pmpaddr0, t0
++	li t0, (PMP_NAPOT | PMP_R | PMP_W | PMP_X)
++	csrw pmpcfg0, t0
++
++	/* Enable M-software interrupt so hart-0 IPIs (CLINT MSIP) are delivered */
++	li t0, MIP_MSIP
++	csrs mie, t0
++
++	/* MPP = S-mode, then mret into the S-mode park loop */
++	li t0, MSTATUS_MPP
++	csrc mstatus, t0
++	li t0, MSTATUS_MPP_S
++	csrs mstatus, t0
++	la t0, core1_smode_park_loop
++	csrw mepc, t0
++	mret
++#elif CONFIG_MP_MAX_NUM_CPUS > 1
+ 	la t0, riscv_cpu_wake_flag
+ 	li t1, -1
+ 	sr t1, 0(t0)
+diff --git a/boards/qemu/riscv64/board.cmake b/boards/qemu/riscv64/board.cmake
+index af83c16f7fb..c5888d0cb99 100644
+--- a/boards/qemu/riscv64/board.cmake
++++ b/boards/qemu/riscv64/board.cmake
+@@ -29,6 +29,14 @@ if(CONFIG_RISCV_S_MODE)
+   string(APPEND qemu_riscv_cpu ",s=on,u=on,pmp=on,priv_spec=v1.12.0,sv39=on")
+ endif()
+ 
++if(CONFIG_BAREMETAL_SUITE)
++  # The S-mode CPU string above advertises sv39 but not the MMU capability, and
++  # QEMU keeps satp read-only-zero (Bare mode) unless mmu=on. The bare-metal
++  # suite (P1*) enables Sv39 paging itself, so add it. Gated to keep normal
++  # Zephyr builds unchanged.
++  string(APPEND qemu_riscv_cpu ",mmu=on")
++endif()
++
+ set(QEMU_CPU_TYPE_${ARCH} "${qemu_riscv_cpu}")
+ 
+ set(QEMU_FLAGS_${ARCH}

@@ -1,0 +1,8 @@
+common:
+  tags: riscv interrupt
+tests:
+  app.zephyr_suite.p2_interrupts:
+    platform_allow:
+      - qemu_riscv64/qemu_virt_riscv64/smode
+    integration_platforms:
+      - qemu_riscv64/qemu_virt_riscv64/smode
